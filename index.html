@@ -2127,13 +2127,18 @@ body {
   </div>
 </div>
 
+<!-- Browser-support banner — shown when the File System Access API is missing (Firefox/Safari) -->
+<div id="browser-warn" style="display:none;background:#7c2d12;color:#fed7aa;font-size:12px;padding:8px 16px;text-align:center">
+  SD card scanning needs Chrome or Edge (File System Access API). You can still browse and edit your synced library here.
+</div>
+
 <!-- ── MAIN ── -->
 <main class="main" id="main">
   <!-- Empty state -->
   <div class="empty-state" id="empty-state">
     <div class="empty-icon">🎮</div>
     <div class="empty-title">No games yet</div>
-    <div class="empty-sub">Connect your Analogue Pocket SD card and hit <strong>Scan Pocket</strong> to import your library. Then hit <strong>Enrich</strong> to pull box art and metadata from ScreenScraper. Your data is saved to Google Drive.</div>
+    <div class="empty-sub" id="empty-sub">Connect your Analogue Pocket SD card and hit <strong>Scan Pocket</strong> to import your library. Then hit <strong>Enrich</strong> to pull box art and metadata from libretro, TheGamesDB and itch.io. Your data is saved to Google Drive.</div>
   </div>
 
   <!-- No results -->
@@ -2386,7 +2391,7 @@ body {
           <input class="field-input" id="ss-proxy" type="text" placeholder="https://your-worker.yourname.workers.dev/?url=">
         </div>
         <div class="field-hint">
-          Used to route API requests (TGDB, SGDB) through your own proxy to avoid CORS blocks. Deploy a free <a href="https://workers.cloudflare.com" target="_blank">Cloudflare Worker</a> and paste its URL here.
+          Used to route API requests (TGDB) through your own proxy to avoid CORS blocks. Deploy a free <a href="https://workers.cloudflare.com" target="_blank">Cloudflare Worker</a> and paste its URL here.
         </div>
       </div>
 
@@ -2408,9 +2413,9 @@ body {
       <div class="settings-section" style="gap:6px">
         <div class="settings-section-title">About</div>
         <div style="font-size:12px;color:var(--text-muted);line-height:1.6">
-          Cartridge Index <span id="app-version">v0.5.11</span><br>
+          Cartridge Index <span id="app-version"></span><br>
           Reads from Analogue Pocket SD card via File System Access API.<br>
-          Metadata from <a href="https://www.screenscraper.fr" target="_blank" style="color:var(--accent)">ScreenScraper</a>.<br>
+          Box art and metadata from <a href="https://github.com/libretro-thumbnails" target="_blank" style="color:var(--accent)">libretro-thumbnails</a>, <a href="https://thegamesdb.net" target="_blank" style="color:var(--accent)">TheGamesDB</a> and <a href="https://itch.io" target="_blank" style="color:var(--accent)">itch.io</a>.<br>
           Library synced to Google Drive appdata.
         </div>
         <button class="btn" id="settings-clear-data" style="width:fit-content;color:#f87171;margin-top:4px">Clear all game data</button>
@@ -2485,7 +2490,7 @@ body {
 
 <script>
 /* ═══════════════════════════════════════════════════════════
-   CARTRIDGE INDEX — v0.5.3
+   CARTRIDGE INDEX
    github.com/clickysteve/cartridge-index
    games.clickysteve.com
 ═══════════════════════════════════════════════════════════ */
@@ -2493,7 +2498,7 @@ body {
 'use strict';
 
 // ── CONFIG ──────────────────────────────────────────────
-const APP_VERSION    = 'v0.5.45';
+const APP_VERSION    = 'v0.5.46';
 const GOOGLE_CLIENT_ID = '1014634679996-uqoho41464ps4oseerjveu2vo3ttm7lh.apps.googleusercontent.com';
 const SCOPE          = 'https://www.googleapis.com/auth/drive.appdata';
 const DRIVE_FILENAME = 'cartridge-index-state.json';
@@ -2501,14 +2506,10 @@ const TOKEN_KEY      = 'cartridge:gtoken:v1';
 const SS_CREDS_KEY   = 'cartridge:ss:creds:v1';
 
 const SS_API        = 'https://www.screenscraper.fr/api2/jeuInfos.php';
-// CORS proxy list — only allorigins as last-ditch fallback; CF Worker (set in Settings) is preferred.
-const SS_PROXY_LIST = [
-  url => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
-];
-let ssCorsProxyIdx = 0;
 
 // General CORS proxy: routes any URL through the CF Worker if configured, else allorigins.
-// Used for TGDB, SGDB, and SS.
+// Reads settings live, so proxy changes in Settings take effect immediately (no reload).
+// Used for TGDB and SS.
 function corsProxy(url) {
   const worker = getSsCreds().proxy; // reuse the SS proxy setting
   if (worker) return worker + encodeURIComponent(url);
@@ -2519,12 +2520,6 @@ const TGDB_API      = 'https://api.thegamesdb.net/v1';
 const TGDB_KEY_KEY  = 'cartridge:tgdb:key:v1';
 // Platform IDs in TheGamesDB
 const TGDB_PLATFORMS = { gb: 4, gbc: 41, gba: 5, nes: 7, snes: 6, pocket: 4 };
-
-const SGDB_API      = 'https://www.steamgriddb.com/api/v2';
-const SGDB_KEY_KEY  = 'cartridge:sgdb:key:v1';
-
-const ITCH_API_KEY  = '5YGz0Yrp6dKu9oADRV2FUwC7BjGJ54RuGEdNiHHu';
-const ITCH_API      = 'https://itch.io/api/1/' + ITCH_API_KEY;
 
 const LIBRETRO_SYSTEMS = {
   gb:     'Nintendo_-_Game_Boy',
@@ -2560,6 +2555,9 @@ let library = { games: [], collections: [], lastSync: null, version: 1 };
 let driveFileId = null;
 let isSyncing = false;
 let gapiReady = false;
+let loadSucceeded = false;        // gates auto-save: never overwrite Drive before a successful load
+let saveQueued = false;           // set when an edit lands while a save is in flight
+let lastKnownModifiedTime = null; // remote modifiedTime at last load/save — used for conflict detection
 
 let ui = {
   platform:   'all',
@@ -2620,9 +2618,16 @@ function shuffle(arr) {
   return a;
 }
 
-function waitFor(fn, interval = 200) {
-  return new Promise(res => {
-    const t = setInterval(() => { if (fn()) { clearInterval(t); res(); } }, interval);
+function waitFor(fn, interval = 200, timeoutMs = 15000) {
+  return new Promise((res, rej) => {
+    const start = Date.now();
+    const t = setInterval(() => {
+      if (fn()) { clearInterval(t); res(); }
+      else if (Date.now() - start > timeoutMs) {
+        clearInterval(t);
+        rej(new Error('waitFor timed out')); // e.g. Google scripts blocked by adblock/proxy
+      }
+    }, interval);
   });
 }
 
@@ -2690,6 +2695,9 @@ function makeTokenClient(onSuccess, onError) {
         onError && onError(resp);
       }
     },
+    // Fires when the user closes the consent popup or it fails to open —
+    // without this, dismissing the popup left the UI stuck on "Opening Google sign-in…"
+    error_callback: err => { onError && onError(err); },
   });
 }
 
@@ -2718,9 +2726,47 @@ async function driveLoad() {
     method: 'GET',
     params: { alt: 'media' },
   });
+  lastKnownModifiedTime = f.modifiedTime || null;
+  // A parse failure is an ERROR, not "no file" — returning null here would let
+  // an empty library silently overwrite the (possibly recoverable) remote copy.
+  const data = typeof r.body === 'string' ? JSON.parse(r.body) : r.body;
+  scrubBlobUrls(data);
+  return data;
+}
+
+// blob: URLs are only valid for the session that created them — strip them from
+// anything loaded from or saved to Drive so dead entries never sync (see videoBlobUrl).
+function scrubBlobUrls(data) {
+  if (!data || !Array.isArray(data.games)) return;
+  for (const g of data.games) {
+    delete g.videoBlobUrl; // session-only; rescanning the SD card recreates it
+    if (typeof g.boxArt === 'string' && g.boxArt.startsWith('blob:')) g.boxArt = null;
+    if (Array.isArray(g.screenshots)) g.screenshots = g.screenshots.filter(s => typeof s === 'string' && !s.startsWith('blob:'));
+  }
+}
+
+// JSON.stringify replacer for saves: drops session-only blob: URLs without mutating the live library
+function persistReplacer(key, value) {
+  if (key === 'videoBlobUrl') return undefined;
+  if (key === 'boxArt' && typeof value === 'string' && value.startsWith('blob:')) return null;
+  if (Array.isArray(value)) return value.filter(x => !(typeof x === 'string' && x.startsWith('blob:')));
+  return value;
+}
+
+// Has the Drive copy changed since we last loaded/saved it (another device/tab)?
+async function remoteChangedSinceLoad() {
+  if (!driveFileId || !lastKnownModifiedTime) return false;
   try {
-    return typeof r.body === 'string' ? JSON.parse(r.body) : r.body;
-  } catch { return null; }
+    const r = await gapi.client.request({
+      path: 'https://www.googleapis.com/drive/v3/files/' + driveFileId,
+      method: 'GET',
+      params: { fields: 'modifiedTime' },
+    });
+    const mt = r.result && r.result.modifiedTime;
+    return !!(mt && mt !== lastKnownModifiedTime);
+  } catch {
+    return false; // metadata check failure shouldn't block saving
+  }
 }
 
 async function driveSave(data) {
@@ -2739,13 +2785,13 @@ async function driveSave(data) {
     '--' + boundary,
     'Content-Type: application/json; charset=UTF-8',
     '',
-    JSON.stringify(data),
+    JSON.stringify(data, persistReplacer),
     '--' + boundary + '--',
   ].join('\r\n');
 
   const url = 'https://www.googleapis.com/upload/drive/v3/files'
     + (driveFileId ? '/' + driveFileId : '')
-    + '?uploadType=multipart';
+    + '?uploadType=multipart&fields=id,modifiedTime';
 
   const resp = await fetch(url, {
     method: driveFileId ? 'PATCH' : 'POST',
@@ -2763,6 +2809,17 @@ async function driveSave(data) {
 
   const result = await resp.json();
   if (!driveFileId && result.id) driveFileId = result.id;
+  if (result.modifiedTime) lastKnownModifiedTime = result.modifiedTime;
+}
+
+// Silent token refresh via GIS — resolves once a fresh access token is set on gapi
+function refreshTokenSilently() {
+  return new Promise((resolve, reject) => {
+    try {
+      const tc = makeTokenClient(() => resolve(true), err => reject(err || new Error('token refresh failed')));
+      tc.requestAccessToken({ prompt: '' });
+    } catch (e) { reject(e); }
+  });
 }
 
 // Debounced auto-save
@@ -2770,21 +2827,58 @@ let saveTimer;
 function scheduleSave() {
   clearTimeout(saveTimer);
   setSyncStatus('Pending…');
-  saveTimer = setTimeout(async () => {
-    if (isSyncing) return;
-    isSyncing = true;
-    setSyncStatus('Saving…', 'syncing');
+  saveTimer = setTimeout(runSave, 2000);
+}
+
+async function runSave() {
+  // Never overwrite the Drive copy with local state if the initial load failed —
+  // the remote file may hold the user's real library.
+  if (!loadSucceeded) {
+    setSyncStatus('Sync paused — reload to reconnect', 'err');
+    return;
+  }
+  if (isSyncing) { saveQueued = true; return; } // don't drop the edit — flush after the in-flight save
+  isSyncing = true;
+  setSyncStatus('Saving…', 'syncing');
+  try {
+    // Conflict check: another device/tab may have written since we loaded
+    if (await remoteChangedSinceLoad()) {
+      const overwrite = confirm(
+        'Your library on Google Drive was changed from another device or tab since this page loaded.\n\n' +
+        'OK = overwrite it with this device’s copy\nCancel = discard local changes and reload the Drive copy'
+      );
+      if (!overwrite) {
+        const data = await driveLoad();
+        if (data && data.games) {
+          library = data;
+          if (!library.collections) library.collections = [];
+          renderGames();
+        }
+        setSyncStatus('Reloaded from Drive', 'ok');
+        return;
+      }
+    }
     try {
       await driveSave(library);
-      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      setSyncStatus('Synced ' + t, 'ok');
     } catch (e) {
-      console.warn('[pocket] drive save failed', e);
-      setSyncStatus('Sync failed', 'err');
-    } finally {
-      isSyncing = false;
+      // Expired/revoked token → one silent refresh + retry before giving up
+      if (/\b401\b/.test(String(e.message))) {
+        await refreshTokenSilently();
+        await driveSave(library);
+      } else {
+        throw e;
+      }
     }
-  }, 2000);
+    const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    setSyncStatus('Synced ' + t, 'ok');
+  } catch (e) {
+    console.warn('[pocket] drive save failed', e);
+    setSyncStatus('Sync failed', 'err');
+    toast('Google Drive sync failed — your latest changes are NOT saved. Check your connection or reload to sign in again.', 'err');
+  } finally {
+    isSyncing = false;
+    if (saveQueued) { saveQueued = false; scheduleSave(); }
+  }
 }
 
 // ── POCKET SCANNER ───────────────────────────────────────
@@ -2804,151 +2898,157 @@ async function scanPocket() {
 
   toast('Scanning SD card…');
   showProgress('Scanning SD card…', 10);
-
-  let assetsDir;
   try {
-    assetsDir = await root.getDirectoryHandle('Assets', { create: false });
-  } catch {
-    // Try finding it in subdirectories (some users may navigate to Assets directly)
-    assetsDir = root;
-  }
 
-  const found = [];
-  const videoMap = new Map(); // stem (lowercase, no ext) → FileSystemFileHandle
-  await walkDir(assetsDir, found, '', videoMap);
+    let assetsDir;
+    try {
+      assetsDir = await root.getDirectoryHandle('Assets', { create: false });
+    } catch {
+      // Try finding it in subdirectories (some users may navigate to Assets directly)
+      assetsDir = root;
+    }
 
-  // Also scan GB Studio folder for .pocket files (GB Studio homebrew)
-  try {
-    const gbStudioDir = await root.getDirectoryHandle('GB Studio', { create: false });
-    const gbStudioFound = [];
-    await walkDir(gbStudioDir, gbStudioFound, '', videoMap);
-    // Mark .pocket files as homebrew since they won't be on ScreenScraper
-    for (const g of gbStudioFound) {
-      if (g.filename.toLowerCase().endsWith('.pocket')) {
-        g.homebrew = true;
-        g.ssAttempted = true;
-        g.source = 'gbstudio';
+    const found = [];
+    const videoMap = new Map(); // stem (lowercase, no ext) → FileSystemFileHandle
+    await walkDir(assetsDir, found, '', videoMap);
+
+    // Also scan GB Studio folder for .pocket files (GB Studio homebrew)
+    try {
+      const gbStudioDir = await root.getDirectoryHandle('GB Studio', { create: false });
+      const gbStudioFound = [];
+      await walkDir(gbStudioDir, gbStudioFound, '', videoMap);
+      // Mark .pocket files as homebrew since they won't be on ScreenScraper
+      for (const g of gbStudioFound) {
+        if (g.filename.toLowerCase().endsWith('.pocket')) {
+          g.homebrew = true;
+          g.ssAttempted = true;
+          g.source = 'gbstudio';
+        }
+        found.push(g);
       }
-      found.push(g);
+    } catch {
+      // No GB Studio folder — that's fine
     }
-  } catch {
-    // No GB Studio folder — that's fine
-  }
 
-  hideProgress();
 
-  if (found.length === 0) {
-    toast('No ROM files found. Make sure you selected your SD card root (or Assets folder).', 'err');
-    return;
-  }
-
-  // Merge into library: add new, keep existing user data (status/notes/rating)
-  const existingMap = new Map(library.games.map(g => [g.id, g]));
-  let addedCount = 0;
-  const newEntries = []; // track genuinely new entries for rename-detection
-
-  for (const { filename, platform, path: filePath, source, homebrew, ssAttempted } of found) {
-    const id = gameId(platform, filename);
-    if (!existingMap.has(id)) {
-      const entry = {
-        id,
-        filename,
-        filePath: filePath || '',
-        platform,
-        source: source || 'pocket',
-        title: cleanTitle(filename),
-        boxArt: null,
-        screenshots: [],
-        year: null,
-        genre: null,
-        developer: null,
-        publisher: null,
-        players: null,
-        ssId: null,
-        homebrew: homebrew || false,
-        ssAttempted: ssAttempted || false,
-        status: 'unplayed',
-        rating: null,
-        notes: '',
-        dateAdded: new Date().toISOString().slice(0, 10),
-        lastPlayed: null,
-      };
-      existingMap.set(id, entry);
-      newEntries.push(entry);
-      addedCount++;
-    } else {
-      // Always update path on rescan (SD card might be at a different mount point)
-      if (filePath) existingMap.get(id).filePath = filePath;
+    if (found.length === 0) {
+      toast('No ROM files found. Make sure you selected your SD card root (or Assets folder).', 'err');
+      return;
     }
-  }
 
-  library.games = [...existingMap.values()];
-  library.lastSync = new Date().toISOString();
-  library.sources = ['pocket'];
+    // Merge into library: add new, keep existing user data (status/notes/rating)
+    const existingMap = new Map(library.games.map(g => [g.id, g]));
+    let addedCount = 0;
+    const newEntries = []; // track genuinely new entries for rename-detection
 
-  // Match videos from the SD card to games and create session blob URLs
-  if (videoMap.size > 0) {
-    let videoCount = 0;
-    for (const game of library.games) {
-      const stem = game.filename.replace(/\.[^.]+$/, '').toLowerCase();
-      const handle = videoMap.get(stem);
-      if (handle) {
-        try {
-          const file = await handle.getFile();
-          // Revoke previous blob URL if any to avoid memory leak
-          if (game.videoBlobUrl) URL.revokeObjectURL(game.videoBlobUrl);
-          game.videoBlobUrl = URL.createObjectURL(file);
-          videoCount++;
-        } catch { /* file handle stale or inaccessible */ }
+    for (const { filename, platform, path: filePath, source, homebrew, ssAttempted } of found) {
+      const id = gameId(platform, filename);
+      if (!existingMap.has(id)) {
+        const entry = {
+          id,
+          filename,
+          filePath: filePath || '',
+          platform,
+          source: source || 'pocket',
+          title: cleanTitle(filename),
+          boxArt: null,
+          screenshots: [],
+          year: null,
+          genre: null,
+          developer: null,
+          publisher: null,
+          players: null,
+          ssId: null,
+          homebrew: homebrew || false,
+          ssAttempted: ssAttempted || false,
+          status: 'unplayed',
+          rating: null,
+          notes: '',
+          dateAdded: new Date().toISOString().slice(0, 10),
+          lastPlayed: null,
+        };
+        existingMap.set(id, entry);
+        newEntries.push(entry);
+        addedCount++;
+      } else {
+        // Always update path on rescan (SD card might be at a different mount point)
+        if (filePath) existingMap.get(id).filePath = filePath;
       }
     }
-    if (videoCount > 0) console.log('[CI] Matched', videoCount, 'video snaps from SD card');
-  }
 
-  renderGames();
-  scheduleSave();
-  toast(addedCount > 0
-    ? addedCount + ' new game' + (addedCount !== 1 ? 's' : '') + ' added (' + library.games.length + ' total)'
-    : 'Library up to date — ' + library.games.length + ' games', 'ok');
+    library.games = [...existingMap.values()];
+    library.lastSync = new Date().toISOString();
+    library.sources = ['pocket'];
 
-  // Enable enrich button
-  el('btn-enrich').disabled = false;
-
-  // Orphan + rename detection — runs on every scan
-  {
-    const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const foundIds = new Set(found.map(f => gameId(f.platform, f.filename)));
-    // Orphans: in library but not on the SD card this scan
-    const orphans = library.games.filter(g => !foundIds.has(g.id));
-
-    if (orphans.length > 0) {
-      // For each orphan, check if a new entry looks like a rename of it
-      const matchedOrphanIds = new Set();
-      const mergeCandidates = [];
-
-      for (const entry of newEntries) {
-        const nNew = norm(entry.title);
-        for (const orphan of orphans) {
-          if (orphan.platform !== entry.platform) continue;
-          const nOld = norm(orphan.title);
-          const longer = Math.max(nNew.length, nOld.length);
-          const shorter = Math.min(nNew.length, nOld.length);
-          const overlap = nNew.includes(nOld) || nOld.includes(nNew);
-          const similar = overlap || (shorter / longer >= 0.8);
-          if (similar) {
-            mergeCandidates.push({ newEntry: entry, orphan });
-            matchedOrphanIds.add(orphan.id);
-          }
+    // Match videos from the SD card to games and create session blob URLs
+    if (videoMap.size > 0) {
+      let videoCount = 0;
+      for (const game of library.games) {
+        const stem = game.filename.replace(/\.[^.]+$/, '').toLowerCase();
+        const handle = videoMap.get(stem);
+        if (handle) {
+          try {
+            const file = await handle.getFile();
+            // Revoke previous blob URL if any to avoid memory leak
+            if (game.videoBlobUrl) URL.revokeObjectURL(game.videoBlobUrl);
+            game.videoBlobUrl = URL.createObjectURL(file);
+            videoCount++;
+          } catch { /* file handle stale or inaccessible */ }
         }
       }
+      if (videoCount > 0) console.log('[CI] Matched', videoCount, 'video snaps from SD card');
+    }
 
-      // Orphans with no rename match = genuinely removed from SD card
-      const removedOrphans = orphans.filter(o => !matchedOrphanIds.has(o.id));
+    renderGames();
+    scheduleSave();
+    toast(addedCount > 0
+      ? addedCount + ' new game' + (addedCount !== 1 ? 's' : '') + ' added (' + library.games.length + ' total)'
+      : 'Library up to date — ' + library.games.length + ' games', 'ok');
 
-      if (mergeCandidates.length > 0 || removedOrphans.length > 0) {
-        showScanCleanupPrompt(mergeCandidates, removedOrphans);
+    // Enable enrich button
+    el('btn-enrich').disabled = false;
+
+    // Orphan + rename detection — runs on every scan
+    {
+      const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const foundIds = new Set(found.map(f => gameId(f.platform, f.filename)));
+      // Orphans: in library but not on the SD card this scan
+      const orphans = library.games.filter(g => !foundIds.has(g.id));
+
+      if (orphans.length > 0) {
+        // For each orphan, check if a new entry looks like a rename of it
+        const matchedOrphanIds = new Set();
+        const mergeCandidates = [];
+
+        for (const entry of newEntries) {
+          const nNew = norm(entry.title);
+          for (const orphan of orphans) {
+            if (orphan.platform !== entry.platform) continue;
+            const nOld = norm(orphan.title);
+            const longer = Math.max(nNew.length, nOld.length);
+            const shorter = Math.min(nNew.length, nOld.length);
+            const overlap = nNew.includes(nOld) || nOld.includes(nNew);
+            const similar = overlap || (shorter / longer >= 0.8);
+            if (similar) {
+              mergeCandidates.push({ newEntry: entry, orphan });
+              matchedOrphanIds.add(orphan.id);
+            }
+          }
+        }
+
+        // Orphans with no rename match = genuinely removed from SD card
+        const removedOrphans = orphans.filter(o => !matchedOrphanIds.has(o.id));
+
+        if (mergeCandidates.length > 0 || removedOrphans.length > 0) {
+          showScanCleanupPrompt(mergeCandidates, removedOrphans);
+        }
       }
     }
+  } catch (e) {
+    console.warn('[CI] scan failed', e);
+    toast('Scan failed: ' + (e.message || e.name || 'unknown error') + '. Re-insert the SD card and try again.', 'err');
+  } finally {
+    hideProgress(); // always clear the overlay — a mid-scan error (e.g. SD card removed) used to leave it stuck
   }
 }
 
@@ -2976,6 +3076,8 @@ function mergeGameData(target, source) {
   target.sgdbAttempted  = source.sgdbAttempted;
   target.dateAdded   = source.dateAdded;
   target.lastPlayed  = source.lastPlayed;
+  target.homebrew       = source.homebrew;       // was dropped — losing it disabled the itch pipeline for merged homebrew
+  target.searchOverride = source.searchOverride; // manual search override must survive a rename-merge
 }
 
 function showScanCleanupPrompt(mergeCandidates, removedOrphans) {
@@ -3244,69 +3346,6 @@ async function enrichGameTgdb(game) {
   }
 }
 
-// ── STEAMGRIDDB ───────────────────────────────────────────
-function getSgdbKey() { return localStorage.getItem(SGDB_KEY_KEY) || ''; }
-function saveSgdbKey(k) { localStorage.setItem(SGDB_KEY_KEY, k); }
-
-async function enrichGameSgdb(game) {
-  const key = getSgdbKey();
-  if (!key || game.sgdbAttempted) return;
-  game.sgdbAttempted = true;
-
-  // Strip leading "NNN " number prefixes (e.g. "044 MegaMan & Bass" → "MegaMan & Bass")
-  const rawTitle = game.searchOverride || game.title;
-  const cleanTitle = rawTitle.replace(/^\d+\s+/, '');
-  const searchTitle = encodeURIComponent(cleanTitle);
-  try {
-    // Route through CF Worker proxy; worker forwards Authorization header to SGDB
-    const authHeaders = { Authorization: `Bearer ${key}` };
-    // Step 1: find the game
-    const searchResp = await fetch(
-      corsProxy(`${SGDB_API}/search/autocomplete/${searchTitle}`),
-      { headers: authHeaders, signal: AbortSignal.timeout(8000) }
-    );
-    if (!searchResp.ok) { console.warn('[CI] SGDB search failed:', searchResp.status); return; }
-    const results = (await searchResp.json())?.data;
-    if (!results?.length) { console.log('[CI] SGDB: no match for', game.title); return; }
-
-    // Best title match
-    const norm = s => s.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-    const q = norm(game.searchOverride || game.title);
-    let best = results[0];
-    for (const r of results) { if (norm(r.name) === q) { best = r; break; } }
-    game.sgdbId = best.id;
-    console.log('[CI] SGDB matched:', game.title, '→', best.name, '(id', best.id + ')');
-
-    // Step 2: fetch grids (portrait box art) only — heroes tend to be fan art
-    const gridsResp = await fetch(
-      corsProxy(`${SGDB_API}/grids/game/${best.id}?dimensions=600x900,342x482&nsfw=false&humor=false&limit=6`),
-      { headers: authHeaders, signal: AbortSignal.timeout(8000) }
-    );
-
-    const newUrls = [];
-    if (gridsResp.ok) {
-      const grids = (await gridsResp.json())?.data || [];
-      const hadBoxArt = !!game.boxArt;
-      // Only set box art if we don't have one yet
-      if (!hadBoxArt && grids[0]?.url) game.boxArt = grids[0].url;
-      // Only add extra grids to gallery if we had no box art to begin with
-      // (if box art already existed from libretro etc., these are just duplicates)
-      if (!hadBoxArt) {
-        grids.slice(1, 4).forEach(g => { if (g.url) newUrls.push(g.url); });
-      }
-    }
-
-    if (newUrls.length) {
-      const existing = new Set(game.screenshots || []);
-      newUrls.forEach(u => existing.add(u));
-      game.screenshots = [...existing];
-      console.log('[CI] SGDB: added', newUrls.length, 'images for', game.title);
-    }
-  } catch (e) {
-    console.warn('[CI] SGDB error for', game.title, ':', e.message);
-  }
-}
-
 async function enrichGame(game) {
   const creds = getSsCreds();
   if (!creds.user || !creds.pass) {
@@ -3564,14 +3603,6 @@ async function findLibretroUrl(game) {
   return null;
 }
 
-// Sync version kept for any remaining callers
-function libretroArtUrl(game) {
-  const sys = LIBRETRO_SYSTEMS[game.platform];
-  if (!sys) return null;
-  return 'https://raw.githubusercontent.com/libretro-thumbnails/' + sys
-    + '/master/Named_Boxarts/' + encodeLibretroName(game.filename.replace(/\.[^.]+$/, '')) + '.png';
-}
-
 // ── FETCH ITCH GAME BY URL ───────────────────────────────
 // itch.io blocks corsproxy.io — try multiple proxies for page scraping.
 // Each proxy has different CORS policies; we try them in order.
@@ -3639,6 +3670,26 @@ async function fetchItchGameByUrl(itchUrl) {
 
   // Page scrape returned no og:image — nothing more we can do
   return null;
+}
+
+// Apply an itch.io match to a game with consistent rules (single source of truth —
+// this logic used to be duplicated 4× with subtly different overwrite behaviour).
+// Default: fill blanks only, MERGE screenshots (never discard user uploads).
+// opts.overwrite: explicit user action — replace art/title, replace remote
+// screenshots but keep data: URL uploads.
+function applyItchMatch(game, match, opts = {}) {
+  if (!match) return false;
+  if (match.cover_url && (opts.overwrite || !game.boxArt)) game.boxArt = match.cover_url;
+  if (match.title && (opts.overwrite || !game.title)) game.title = match.title;
+  if (match.screenshots?.length) {
+    const keep = opts.overwrite
+      ? (game.screenshots || []).filter(s => typeof s === 'string' && s.startsWith('data:'))
+      : (game.screenshots || []);
+    const existing = new Set(keep);
+    match.screenshots.forEach(u => existing.add(u));
+    game.screenshots = [...existing];
+  }
+  return true;
 }
 
 // ── ITCH.IO ART (search-page scrape — works for obscure homebrew) ──
@@ -3799,19 +3850,6 @@ async function findLibretroMedia(boxArtUrl) {
 }
 
 // ── FALLBACK ART (libretro → itch.io) ───────────────────
-async function enrichFallbackArt(game) {
-  if (game.boxArt) return; // already has art
-
-  // Try libretro first (with region-variant fallback)
-  const libUrl = await findLibretroUrl(game);
-  if (libUrl) { game.boxArt = libUrl; return; }
-
-  // Try itch.io — homebrew only (retail games aren't on itch.io)
-  if (game.homebrew) {
-    const itchUrl = await itchArt(game);
-    if (itchUrl) game.boxArt = itchUrl;
-  }
-}
 
 // Enrich a single game: itch.io first for homebrew, then libretro, then SS
 async function enrichOneGame(game) {
@@ -3820,11 +3858,7 @@ async function enrichOneGame(game) {
   if (game.homebrew) {
     if (game.itchUrl) {
       const match = await fetchItchGameByUrl(game.itchUrl);
-      if (match) {
-        if (match.cover_url && !game.boxArt) game.boxArt = match.cover_url;
-        if (match.title && !game.title) game.title = match.title;
-        if (match.screenshots?.length) game.screenshots = match.screenshots;
-      }
+      applyItchMatch(game, match);
     } else if (!game.boxArt) {
       const url = await itchArt(game);
       if (url) game.boxArt = url;
@@ -3851,8 +3885,7 @@ async function enrichOneGame(game) {
     await enrichGameTgdb(game);
   }
 
-  // SteamGridDB disabled — too much fan art
-  // if (getSgdbKey() && !game.sgdbAttempted) await enrichGameSgdb(game);
+  // SteamGridDB removed in v0.5.46 — too much fan art (see git history)
 
   // SS disabled — re-enable when dev credentials are obtained
   // const creds = getSsCreds();
@@ -3870,8 +3903,14 @@ async function enrichAll(scope) {
   // Use provided scope (selected or visible), falling back to all visible
   const visible = scope || getFilteredGames();
   const needArt  = visible.filter(g => !g.boxArt && g.platform !== 'other');
+  // Work still pending in the later passes — the early return below must consider
+  // these too, or adding a TGDB key after art is filled makes Enrich a no-op.
+  const tgdbPending = getTgdbKey()
+    ? visible.filter(g => !g.tgdbAttempted && g.platform !== 'other' && !g.homebrew)
+    : [];
+  const hbShotsPending = visible.filter(g => g.homebrew && g.itchUrl && !(g.screenshots?.length));
 
-  if (needArt.length === 0) {
+  if (needArt.length === 0 && tgdbPending.length === 0 && hbShotsPending.length === 0) {
     const withArt = visible.filter(g => g.boxArt).length;
     toast('All enriched (' + withArt + '/' + visible.length + ' have art). Shift+click to reset and retry.', 'ok');
     el('btn-enrich').disabled = false;
@@ -3895,10 +3934,7 @@ async function enrichAll(scope) {
     showProgress('itch.io (homebrew)… ' + done + '/' + hbQueue.length, Math.round(done / hbQueue.length * 100));
     if (game.itchUrl) {
       const match = await fetchItchGameByUrl(game.itchUrl);
-      if (match) {
-        if (match.cover_url && !game.boxArt) game.boxArt = match.cover_url;
-        if (match.screenshots?.length) game.screenshots = match.screenshots;
-      }
+      applyItchMatch(game, match);
     } else {
       const url = await itchArt(game);
       if (url) game.boxArt = url;
@@ -4235,8 +4271,8 @@ function renderGames() {
 
 function updateBulkCount() {
   el('bulk-count').textContent = selectedIds.size + ' selected';
-  const allVisible = getFilteredGames().every(g => selectedIds.has(g.id));
-  el('bulk-select-all').checked = allVisible && getFilteredGames().length > 0;
+  const filtered = getFilteredGames(); // once — this filters+sorts the whole library
+  el('bulk-select-all').checked = filtered.length > 0 && filtered.every(g => selectedIds.has(g.id));
 }
 
 function cardHTML(g, isDupe = false) {
@@ -4257,11 +4293,11 @@ function cardHTML(g, isDupe = false) {
 
   const errFallback = `var p=document.createElement('div');p.className='card-art-placeholder';p.innerHTML='<div class=\\'card-art-placeholder-icon\\'>🎮</div><div class=\\'card-art-placeholder-label\\'>${plat.label}</div>';this.replaceWith(p)`;
   const artHTML = primarySrc
-    ? `<img src="${primarySrc}" alt="" loading="lazy" onerror="${errFallback}">`
+    ? `<img src="${escHtml(primarySrc)}" alt="" loading="lazy" onerror="${errFallback}">`
     : `<div class="card-art-placeholder"><div class="card-art-placeholder-icon">🎮</div><div class="card-art-placeholder-label">${plat.label}</div></div>`;
 
   // data-video: proxied SS video URL (loaded lazily on hover, never in static HTML)
-  const dataVideo = videoShot ? ` data-video="${escHtml(videoProxyUrl(videoShot))}"` : '';
+  const dataVideo = videoShot ? ` data-video="${escHtml(videoShot)}"` : '';
   // data-imgs: static/GIF cycling images
   const dataImgs = cycleImgs.length ? ` data-imgs="${escHtml(JSON.stringify(cycleImgs))}"` : '';
   // Static hover overlay — only shown when no video and cycling images exist
@@ -4432,7 +4468,7 @@ function renderStats() {
       });
     });
   } else {
-    el('stats-years').innerHTML = '<div style="font-size:11px;color:var(--text-muted)">No year data yet — enrich games with ScreenScraper to populate.</div>';
+    el('stats-years').innerHTML = '<div style="font-size:11px;color:var(--text-muted)">No year data yet — add a TheGamesDB key in Settings and hit Enrich to populate.</div>';
   }
 
   // ── Top developers ──
@@ -4463,7 +4499,7 @@ function renderStats() {
       });
     });
   } else {
-    el('stats-devs').innerHTML = '<div style="font-size:11px;color:var(--text-muted)">No developer data yet — enrich with ScreenScraper to populate.</div>';
+    el('stats-devs').innerHTML = '<div style="font-size:11px;color:var(--text-muted)">No developer data yet — add a TheGamesDB key in Settings and hit Enrich to populate.</div>';
   }
 
   // Backlog picks (up to 6 random unplayed)
@@ -4505,7 +4541,7 @@ function isVideoUrl(src) {
 function mediaProxyUrl(src) {
   if (!src) return src;
   if (src.includes('screenscraper.fr')) {
-    return SS_PROXY_LIST[ssCorsProxyIdx](src);
+    return corsProxy(src); // reads the current Settings proxy — no stale closure
   }
   return src;
 }
@@ -4513,10 +4549,26 @@ function mediaProxyUrl(src) {
 // SS video URLs have credentials embedded as query params and load fine directly
 // in <video> elements (no-cors mode — no Origin header, no CORS needed).
 // Proxying through allorigins breaks streaming because it can't handle Range requests.
-function videoProxyUrl(src) {
-  return src || src;
+// Build a <video> element with a safe error fallback (no innerHTML interpolation — XSS-safe)
+function buildVideoEl(src, styleText) {
+  const vid = document.createElement('video');
+  vid.src = src;
+  vid.controls = true; vid.autoplay = true; vid.loop = true; vid.muted = true;
+  vid.setAttribute('playsinline', '');
+  if (styleText) vid.style.cssText = styleText;
+  vid.addEventListener('error', () => {
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:16px';
+    const icon = document.createElement('div');
+    icon.style.fontSize = '48px'; icon.textContent = '▶';
+    const a = document.createElement('a');
+    a.href = src; a.target = '_blank'; a.rel = 'noopener';
+    a.style.color = 'var(--accent)'; a.textContent = 'Open video in new tab';
+    wrap.append(icon, a);
+    vid.replaceWith(wrap);
+  });
+  return vid;
 }
-
 
 function setFsSlide(idx) {
   fsIdx = ((idx % fsImages.length) + fsImages.length) % fsImages.length;
@@ -4526,13 +4578,11 @@ function setFsSlide(idx) {
     contentEl.innerHTML = '<span style="font-size:48px;opacity:.3">🎮</span>';
   } else if (isVideoUrl(src)) {
     // Use direct URL — corsproxy can't handle video byte-range streaming
-    // No crossorigin attribute so browser loads in no-cors mode (works fine for display)
-    contentEl.innerHTML = `<video src="${videoProxyUrl(src)}" controls autoplay loop muted playsinline style="max-width:94vw;max-height:94vh"
-      onerror="this.outerHTML='<div style=\\'display:flex;flex-direction:column;align-items:center;gap:16px\\'><div style=\\'font-size:48px\\'>▶</div><a href=\\'${src}\\' target=\\'_blank\\' rel=\\'noopener\\' style=\\'color:var(--accent)\\'>Open video in new tab</a></div>'"
-    ></video>`;
+    contentEl.innerHTML = '';
+    contentEl.appendChild(buildVideoEl(src, 'max-width:94vw;max-height:94vh'));
   } else {
     const dsrc = mediaProxyUrl(src);
-    contentEl.innerHTML = `<img src="${dsrc}" alt="" style="width:100%;height:100%;object-fit:contain;image-rendering:pixelated">`;
+    contentEl.innerHTML = `<img src="${escHtml(dsrc)}" alt="" style="width:100%;height:100%;object-fit:contain;image-rendering:pixelated">`;
   }
   el('fs-counter').textContent = fsImages.length > 1 ? (fsIdx + 1) + ' / ' + fsImages.length : '';
   el('fs-prev').style.display = fsImages.length > 1 ? '' : 'none';
@@ -4552,9 +4602,29 @@ function closeFs() {
 }
 
 // ── GAME MODAL ───────────────────────────────────────────
-function openGameModal(id) {
+// Staged (save-on-Save) fields in the game modal — snapshotted by preserveEdits
+const MODAL_EDIT_FIELD_IDS = [
+  'modal-title-input', 'modal-edit-year', 'modal-edit-players', 'modal-edit-genre',
+  'modal-edit-developer', 'modal-edit-publisher', 'modal-art-url', 'modal-notes',
+  'modal-search-override',
+];
+
+function openGameModal(id, opts = {}) {
   const game = library.games.find(g => g.id === id);
   if (!game) return;
+
+  // When refreshing the modal for the SAME game (e.g. after an art change or
+  // screenshot add), snapshot in-progress edits so they aren't silently wiped —
+  // previously a re-open reset title/notes/etc. to stored values mid-edit.
+  let editSnapshot = null;
+  if (opts.preserveEdits && activeGameId === id) {
+    editSnapshot = { fields: {}, tags: [...modalTags] };
+    MODAL_EDIT_FIELD_IDS.forEach(fid => { const n = el(fid); if (n) editSnapshot.fields[fid] = n.value; });
+    const activeStatus = document.querySelector('#modal-status-picker .status-btn.active');
+    editSnapshot.status = activeStatus ? activeStatus.dataset.s : null;
+    editSnapshot.stars = document.querySelectorAll('#modal-stars .star.lit').length;
+  }
+
   activeGameId = id;
 
   const plat = PLATFORMS[game.platform] || PLATFORMS.other;
@@ -4575,12 +4645,11 @@ function openGameModal(id) {
       mainEl.innerHTML = '<span class="gallery-placeholder">🎮</span>';
     } else if (isVideoUrl(src)) {
       // Direct URL — corsproxy can't stream video; no crossorigin for display-only playback
-      mainEl.innerHTML = `<video src="${videoProxyUrl(src)}" controls autoplay loop muted playsinline
-        onerror="this.outerHTML='<div style=\\'display:flex;flex-direction:column;align-items:center;gap:12px;padding:20px\\'><div style=\\'font-size:36px\\'>▶</div><a href=\\'${src}\\' target=\\'_blank\\' rel=\\'noopener\\' style=\\'color:var(--accent);font-size:12px\\'>Open video in new tab</a></div>'"
-      ></video>`;
+      mainEl.innerHTML = '';
+      mainEl.appendChild(buildVideoEl(src));
     } else {
       const dsrc = mediaProxyUrl(src);
-      mainEl.innerHTML = `<img src="${dsrc}" alt="" onerror="this.parentElement.innerHTML='<span class=\\'gallery-placeholder\\'>🎮</span>'">`;
+      mainEl.innerHTML = `<img src="${escHtml(dsrc)}" alt="" onerror="this.parentElement.innerHTML='<span class=\\'gallery-placeholder\\'>🎮</span>'">`;
     }
     // Thumb highlight
     document.querySelectorAll('#modal-gallery-thumbs .gallery-thumb').forEach((t, i) => {
@@ -4599,7 +4668,7 @@ function openGameModal(id) {
       if (isVideoUrl(src)) {
         inner = `<div class="gallery-thumb-video">▶</div>`;
       } else {
-        inner = `<img src="${mediaProxyUrl(src)}" alt="" onerror="this.parentElement.style.display='none'">`;
+        inner = `<img src="${escHtml(mediaProxyUrl(src))}" alt="" onerror="this.parentElement.style.display='none'">`;
       }
       return `<div class="gallery-thumb${i === 0 ? ' active' : ''}" data-idx="${i}">${inner}</div>`;
     }).join('');
@@ -4695,8 +4764,8 @@ function openGameModal(id) {
   // Notes
   el('modal-notes').value = game.notes || '';
 
-  // Tags
-  modalTags = [...(game.tags || [])];
+  // Tags (restored from the edit snapshot when refreshing mid-edit)
+  modalTags = editSnapshot ? editSnapshot.tags : [...(game.tags || [])];
   function renderModalTags() {
     const allTags = getAllTags();
     // Update datalist suggestions (exclude already-added tags)
@@ -4762,6 +4831,20 @@ function openGameModal(id) {
     });
   }
 
+  // Restore in-progress edits captured before this refresh (see preserveEdits above)
+  if (editSnapshot) {
+    for (const [fid, v] of Object.entries(editSnapshot.fields)) {
+      const n = el(fid);
+      if (n) n.value = v;
+    }
+    if (editSnapshot.status) {
+      document.querySelectorAll('#modal-status-picker .status-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.s === editSnapshot.status);
+      });
+    }
+    updateStars(editSnapshot.stars || 0);
+  }
+
   el('game-modal').classList.add('open');
 }
 
@@ -4789,7 +4872,7 @@ function renderShotList(game) {
       if (!game2) return;
       game2.screenshots.splice(+btn.dataset.idx, 1);
       scheduleSave();
-      openGameModal(activeGameId);
+      openGameModal(activeGameId, { preserveEdits: true });
     });
   });
 }
@@ -4853,14 +4936,11 @@ function openSettings() {
 function saveSettings() {
   saveTgdbKey(el('tgdb-key').value.trim());
   const proxy = el('ss-proxy').value.trim();
-  // Preserve any existing SS user creds; just update proxy
+  // Preserve any existing SS user creds; just update proxy.
+  // corsProxy()/mediaProxyUrl() read this setting live — clearing the field
+  // now actually clears the proxy (it used to stick until reload).
   const creds = getSsCreds();
   saveSsCreds({ ...creds, proxy });
-  // If a custom proxy is set, put it first in the list so it's tried first
-  if (proxy) {
-    SS_PROXY_LIST.unshift(url => proxy + encodeURIComponent(url));
-    ssCorsProxyIdx = 0;
-  }
   el('settings-modal').classList.remove('open');
   toast('Settings saved.', 'ok');
   if (library.games.length > 0) el('btn-enrich').disabled = false;
@@ -4968,11 +5048,15 @@ function bootstrap() {
   el('app-version').textContent = APP_VERSION;
   el('app-version-header').textContent = APP_VERSION;
 
-  // Apply saved custom SS proxy (prepend so it's tried first)
-  const savedProxy = getSsCreds().proxy;
-  if (savedProxy) {
-    SS_PROXY_LIST.unshift(url => savedProxy + encodeURIComponent(url));
-    ssCorsProxyIdx = 0;
+  // Firefox/Safari can't scan (no File System Access API) — say so up front
+  // instead of failing silently when Scan is clicked
+  if (!('showDirectoryPicker' in window)) {
+    el('browser-warn').style.display = '';
+    const scanBtn = el('btn-scan');
+    scanBtn.title = 'Requires Chrome or Edge (File System Access API)';
+    scanBtn.style.opacity = '.5';
+    el('empty-sub').innerHTML = 'This browser can’t scan SD cards (Chrome or Edge needed for that), '
+      + 'but sign in with Google and any library you’ve already synced will load here for browsing and editing.';
   }
 
   // Platform tabs
@@ -5045,10 +5129,13 @@ function bootstrap() {
     el('search-wrap').classList.remove('has-value');
     renderGames();
   }
+  // Debounced — renderGames rebuilds the whole grid, far too heavy per keystroke
+  let searchTimer;
   el('search-input').addEventListener('input', e => {
     ui.search = e.target.value;
     el('search-wrap').classList.toggle('has-value', !!e.target.value);
-    renderGames();
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(renderGames, 150);
   });
   el('search-clear').addEventListener('click', () => {
     clearSearch();
@@ -5075,7 +5162,7 @@ function bootstrap() {
       const game = library.games.find(g => g.id === activeGameId);
       if (game) {
         game.boxArt = ev.target.result;
-        openGameModal(game.id); // re-open to refresh gallery
+        openGameModal(game.id, { preserveEdits: true }); // re-open to refresh gallery
       }
     };
     reader.readAsDataURL(file);
@@ -5089,7 +5176,7 @@ function bootstrap() {
     const url = e.target.value.trim();
     if (url !== (game.boxArt || '')) {
       game.boxArt = url || null;
-      openGameModal(game.id);
+      openGameModal(game.id, { preserveEdits: true });
     }
   });
 
@@ -5281,10 +5368,7 @@ function bootstrap() {
       if (candidates.length === 1) {
         // Single result — auto-apply
         const match = await fetchItchGameByUrl(candidates[0].url);
-        if (match) {
-          if (match.cover_url) game.boxArt = match.cover_url;
-          if (match.title && !game.title) game.title = match.title;
-          if (match.screenshots?.length) game.screenshots = match.screenshots;
+        if (applyItchMatch(game, match)) {
           game.itchUrl = match.url || candidates[0].url;
           game.homebrew = true;
         }
@@ -5294,10 +5378,7 @@ function bootstrap() {
         const picked = await showArtPicker(candidates, searchTitle);
         if (picked) {
           const match = await fetchItchGameByUrl(picked.url);
-          if (match) {
-            if (match.cover_url) game.boxArt = match.cover_url;
-            if (match.title && !game.title) game.title = match.title;
-            if (match.screenshots?.length) game.screenshots = match.screenshots;
+          if (applyItchMatch(game, match)) {
             game.itchUrl = match.url || picked.url;
             game.homebrew = true;
           }
@@ -5307,7 +5388,7 @@ function bootstrap() {
 
     btn.disabled = false;
     btn.textContent = 'Enrich';
-    openGameModal(game.id);
+    openGameModal(game.id, { preserveEdits: true });
     renderGames();
     scheduleSave();
     toast(game.boxArt ? 'Art found!' : 'No art found — try setting an itch.io URL manually.', game.boxArt ? 'ok' : '');
@@ -5392,8 +5473,12 @@ function bootstrap() {
       if (e.key === 'ArrowRight') { setFsSlide(fsIdx + 1); return; }
     }
     if (modalOpen) {
-      if (e.key === 'ArrowLeft')  el('gallery-prev').onclick?.();
-      if (e.key === 'ArrowRight') el('gallery-next').onclick?.();
+      // Don't hijack arrow keys while typing in a field — moving the caret
+      // used to flip the gallery on every keypress
+      if (!isEditable) {
+        if (e.key === 'ArrowLeft')  el('gallery-prev').onclick?.();
+        if (e.key === 'ArrowRight') el('gallery-next').onclick?.();
+      }
       // Navigate between games with [ and ]
       if (!isEditable) {
         if (e.key === '[' || e.key === ']') {
@@ -5523,7 +5608,7 @@ function bootstrap() {
     game.screenshots.push(url);
     el('modal-shot-url').value = '';
     scheduleSave();
-    openGameModal(activeGameId);
+    openGameModal(activeGameId, { preserveEdits: true });
   });
   el('modal-shot-upload-btn').addEventListener('click', () => el('modal-shot-file').click());
   el('modal-shot-file').addEventListener('change', e => {
@@ -5536,7 +5621,7 @@ function bootstrap() {
       if (!game.screenshots) game.screenshots = [];
       game.screenshots.push(ev.target.result);
       scheduleSave();
-      openGameModal(activeGameId);
+      openGameModal(activeGameId, { preserveEdits: true });
     };
     reader.readAsDataURL(file);
     e.target.value = '';
@@ -5561,13 +5646,9 @@ function bootstrap() {
     if (!match) { toast('No matching itch.io game found for that URL.', 'err'); return; }
     game.itchUrl = match.url || url;
     game.homebrew = true;
-    // Always overwrite art + title when user explicitly fetches
-    if (match.cover_url) game.boxArt = match.cover_url;
-    if (match.title)     game.title  = match.title;
-    // Replace screenshots with everything from the itch page
-    if (match.screenshots && match.screenshots.length) {
-      game.screenshots = match.screenshots;
-    }
+    // Explicit user fetch — overwrite art + title, replace remote screenshots
+    // (user-uploaded data: screenshots are preserved by applyItchMatch)
+    applyItchMatch(game, match, { overwrite: true });
     el('modal-itch-url-input').value = game.itchUrl;
     el('modal-itch-link').href       = game.itchUrl;
     el('modal-itch-link-row').style.display = 'flex';
@@ -5576,7 +5657,7 @@ function bootstrap() {
     scheduleSave();
     const nShots = match.screenshots?.length || 0;
     toast(`itch.io linked${match.cover_url ? ' · art applied' : ''}${nShots ? ' · ' + nShots + ' screenshots' : ''}!`, 'ok');
-    openGameModal(game.id);
+    openGameModal(game.id, { preserveEdits: true });
   });
 
   // Live update itch URL field
@@ -5617,7 +5698,14 @@ async function startAuth() {
     return;
   }
 
-  await waitFor(() => typeof google !== 'undefined' && google.accounts);
+  try {
+    await waitFor(() => typeof google !== 'undefined' && google.accounts);
+  } catch (e) {
+    console.warn('[pocket] Google Identity Services failed to load', e);
+    overlay.classList.add('open');
+    authStatus.textContent = 'Google sign-in scripts failed to load (adblock or network issue?). Reload to retry.';
+    return;
+  }
 
   const onAuth = async () => {
     overlay.classList.remove('open');
@@ -5631,13 +5719,28 @@ async function startAuth() {
           el('btn-enrich').disabled = false;
         }
       }
+      // Success (including "no file yet" on first run) — safe to allow auto-saves
+      loadSucceeded = true;
+      const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      setSyncStatus('Synced ' + t, 'ok');
     } catch (e) {
+      // Do NOT mark loadSucceeded — auto-save stays disabled so a failed load
+      // can never cause an empty local library to overwrite the Drive copy.
       console.warn('[pocket] drive load failed', e);
-      setSyncStatus('Drive load failed', 'err');
+      const status = e && (e.status || (e.result && e.result.error && e.result.error.code));
+      if (status === 401 || status === 403) {
+        // Cached token revoked/expired server-side — ask the user to sign in again
+        clearStoredToken();
+        gapi.client.setToken(null);
+        overlay.classList.add('open');
+        authStatus.textContent = 'Your Google session expired — please sign in again.';
+        setSyncStatus('Signed out', 'err');
+      } else {
+        setSyncStatus('Drive load failed', 'err');
+        toast('Could not load your library from Google Drive. Sync is paused to protect the saved copy — reload the page to retry.', 'err');
+      }
     }
     renderGames();
-    const t = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    setSyncStatus('Synced ' + t, 'ok');
   };
 
   tokenClient = makeTokenClient(onAuth, () => {
