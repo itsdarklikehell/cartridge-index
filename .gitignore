@@ -5,3 +5,6 @@ _local/
 .vscode/
 *.swp
 *.swo
+node_modules/
+package.json
+package-lock.json

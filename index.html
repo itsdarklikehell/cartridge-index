@@ -3,7 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0a0a0a">
 <title>Cartridge Index</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23fb923c'/><text x='16' y='22' font-size='18' text-anchor='middle' fill='white'>🎮</text></svg>" type="image/svg+xml">
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://apis.google.com/js/api.js" async defer></script>
@@ -384,7 +387,7 @@ body {
   padding: 1px 4px;
 }
 
-#sort-select, #art-filter-select, #hb-filter-select, #tag-filter-select {
+#sort-select, #art-filter-select, #hb-filter-select, #tag-filter-select, #genre-filter-select {
   background: var(--surface-2);
   border: 1px solid var(--border-2);
   border-radius: 6px;
@@ -2102,11 +2105,15 @@ body {
       <select id="tag-filter-select" title="Filter by tag" style="display:none">
         <option value="all">🏷 Tags</option>
       </select>
+      <select id="genre-filter-select" title="Filter by genre" style="display:none">
+        <option value="all">🎭 Genres</option>
+      </select>
       <div class="card-size-wrap" title="Card size">
         ⊞
         <input type="range" id="card-size-slider" min="100" max="300" value="160" step="10">
       </div>
       <button class="vtog" id="btn-grid-img" title="Show screenshots in grid" style="font-size:13px">📷</button>
+      <button class="vtog" id="btn-random" title="Pick a random game (prefers unplayed, respects filters)" style="font-size:13px">🎲</button>
       <button class="vtog" id="btn-bulk" title="Bulk select">☑</button>
       <div class="view-toggle">
         <button class="vtog active" data-view="grid" title="Grid view">⊞</button>
@@ -2500,7 +2507,7 @@ body {
 'use strict';
 
 // ── CONFIG ──────────────────────────────────────────────
-const APP_VERSION    = 'v0.5.47';
+const APP_VERSION    = 'v0.6.0'; // keep in sync with CACHE in sw.js (CI checks)
 const GOOGLE_CLIENT_ID = '1014634679996-uqoho41464ps4oseerjveu2vo3ttm7lh.apps.googleusercontent.com';
 const SCOPE          = 'https://www.googleapis.com/auth/drive.appdata';
 const DRIVE_FILENAME = 'cartridge-index-state.json';
@@ -2567,6 +2574,7 @@ let ui = {
   art:        'all',
   homebrew:   'all',
   tag:        'all',
+  genre:      'all',
   sort:       'title',
   search:     '',
   view:       'grid',
@@ -2659,22 +2667,30 @@ function setSyncStatus(text, kind = '') {
 }
 
 // ── GOOGLE AUTH & DRIVE ──────────────────────────────────
+// The access token lives in sessionStorage (per-tab, gone when the tab closes)
+// rather than localStorage: a persisted bearer token was the main prize any XSS
+// could steal. New tabs need one sign-in click; with an existing Google grant
+// that's a popup that closes itself. Mid-session expiry is handled by silent
+// refresh in the save path.
 function loadStoredToken() {
   try {
-    const raw = localStorage.getItem(TOKEN_KEY);
+    const raw = sessionStorage.getItem(TOKEN_KEY);
     if (!raw) return null;
     const t = JSON.parse(raw);
-    if (Date.now() > t.expiresAt) { localStorage.removeItem(TOKEN_KEY); return null; }
+    if (Date.now() > t.expiresAt) { sessionStorage.removeItem(TOKEN_KEY); return null; }
     return t;
   } catch { return null; }
 }
 function saveStoredToken(token, expiresIn) {
-  localStorage.setItem(TOKEN_KEY, JSON.stringify({
+  sessionStorage.setItem(TOKEN_KEY, JSON.stringify({
     accessToken: token,
     expiresAt: Date.now() + (expiresIn - 60) * 1000,
   }));
 }
-function clearStoredToken() { localStorage.removeItem(TOKEN_KEY); }
+function clearStoredToken() {
+  sessionStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(TOKEN_KEY); // clean up tokens persisted by pre-v0.5.48 builds
+}
 
 async function initGapi() {
   await waitFor(() => typeof gapi !== 'undefined');
@@ -2771,9 +2787,18 @@ async function remoteChangedSinceLoad() {
   }
 }
 
+let driveSizeWarned = false;
 async function driveSave(data) {
   const token = gapi.client.getToken()?.access_token;
   if (!token) throw new Error('No access token');
+
+  const serialized = JSON.stringify(data, persistReplacer);
+  // Every save re-uploads the whole library — warn once if it's getting heavy
+  // (usually caused by many uploaded images; they're compressed on the way in now)
+  if (serialized.length > 8 * 1024 * 1024 && !driveSizeWarned) {
+    driveSizeWarned = true;
+    toast('Heads up: your library sync file is over 8MB (' + Math.round(serialized.length / 1024 / 1024) + 'MB) — saves may get slow. Uploaded images are the usual culprit.', '');
+  }
 
   const meta = { name: DRIVE_FILENAME };
   if (!driveFileId) meta.parents = ['appDataFolder'];
@@ -2787,7 +2812,7 @@ async function driveSave(data) {
     '--' + boundary,
     'Content-Type: application/json; charset=UTF-8',
     '',
-    JSON.stringify(data, persistReplacer),
+    serialized,
     '--' + boundary + '--',
   ].join('\r\n');
 
@@ -3001,6 +3026,17 @@ async function scanPocket() {
       if (videoCount > 0) console.log('[CI] Matched', videoCount, 'video snaps from SD card');
     }
 
+    // Pocket Memories screenshots + battery-save detection
+    try {
+      const mem = await importMemories(root);
+      if (mem.imported) toast(mem.imported + ' Pocket screenshot' + (mem.imported !== 1 ? 's' : '') + ' imported from Memories.', 'ok');
+      if (mem.imported || mem.savesFound) {
+        console.log('[CI] Memories:', mem.imported, 'screenshots imported;', mem.savesFound, 'newly save-flagged games (of', mem.shotsSeen, 'shots seen)');
+      }
+    } catch (e) {
+      console.warn('[CI] Memories scan failed', e);
+    }
+
     renderGames();
     scheduleSave();
     toast(addedCount > 0
@@ -3209,6 +3245,108 @@ async function walkDir(dirHandle, results, path, videoMap) {
       }
     }
   }
+}
+
+// ── POCKET MEMORIES & SAVES ──────────────────────────────
+// The Pocket writes screenshots (Analogue + Start) into /Memories on the SD card
+// and battery saves into /Saves (and /GB Studio/Saves). The exact screenshot
+// naming varies by firmware, so matching is deliberately fuzzy: normalise the
+// filename, strip trailing timestamp/counter junk, then compare against each
+// game's title and ROM stem, longest match wins.
+
+async function collectFilesRecursive(dirHandle, extRe, out, depth = 0) {
+  if (depth > 6) return;
+  for await (const [name, handle] of dirHandle.entries()) {
+    if (name.startsWith('.')) continue;
+    if (handle.kind === 'directory') await collectFilesRecursive(handle, extRe, out, depth + 1);
+    else if (handle.kind === 'file' && extRe.test(name)) out.push({ name, handle });
+  }
+}
+
+function normForMatch(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Strip extension + trailing date/time/counter segments from a screenshot name
+function screenshotStem(name) {
+  return name
+    .replace(/\.[^.]+$/, '')
+    .replace(/[\s_.-]*\d{4}[-_.]?\d{2}[-_.]?\d{2}[\s_.\-T]*\d{0,2}[-_.:]?\d{0,2}[-_.:]?\d{0,2}$/, '')
+    .replace(/[\s_.-]*\d+$/, '')
+    .trim();
+}
+
+function matchShotToGame(name, games) {
+  const stem = normForMatch(screenshotStem(name));
+  if (stem.length < 3) return null;
+  let best = null, bestLen = 0;
+  for (const g of games) {
+    for (const c of [g.title, g.filename.replace(/\.[^.]+$/, '')]) {
+      const n = normForMatch(c);
+      if (n.length < 3) continue;
+      if ((stem === n || stem.startsWith(n) || n.startsWith(stem)) && n.length > bestLen) {
+        best = g; bestLen = n.length;
+      }
+    }
+  }
+  return best;
+}
+
+async function importMemories(root) {
+  // ── Screenshots ──
+  const shots = [];
+  try {
+    const memDir = await root.getDirectoryHandle('Memories', { create: false });
+    await collectFilesRecursive(memDir, /\.(png|bmp|jpg|jpeg)$/i, shots);
+  } catch { /* no Memories folder on this card */ }
+
+  const matches = [];
+  for (const f of shots) {
+    const game = matchShotToGame(f.name, library.games);
+    if (game && !(game.memoriesImported || []).includes(f.name)) matches.push({ ...f, game });
+  }
+
+  let imported = 0;
+  if (matches.length && confirm(
+    'Found ' + matches.length + ' new Pocket screenshot' + (matches.length !== 1 ? 's' : '') +
+    ' in Memories matching your games.\n\nImport them into the matching game galleries?'
+  )) {
+    const MAX_PER_GAME = 12;
+    for (const m of matches) {
+      try {
+        const g = m.game;
+        if (!g.memoriesImported) g.memoriesImported = [];
+        if (g.memoriesImported.length >= MAX_PER_GAME) continue;
+        const file = await m.handle.getFile();
+        const dataUrl = await compressImageToDataUrl(file, 640); // GB-scale shots stay lossless PNG
+        if (!g.screenshots) g.screenshots = [];
+        if (!g.screenshots.includes(dataUrl)) g.screenshots.push(dataUrl);
+        g.memoriesImported.push(m.name); // remember the filename so rescans don't re-import
+        imported++;
+      } catch { /* unreadable file — skip */ }
+    }
+  }
+
+  // ── Battery saves ──
+  const saveStems = new Set();
+  for (const dirName of ['Saves', 'GB Studio']) {
+    try {
+      const d = await root.getDirectoryHandle(dirName, { create: false });
+      const files = [];
+      await collectFilesRecursive(d, /\.(sav|srm|rtc)$/i, files);
+      files.forEach(f => saveStems.add(f.name.replace(/\.[^.]+$/, '').toLowerCase()));
+    } catch { /* absent */ }
+  }
+  let savesFound = 0;
+  if (saveStems.size) {
+    for (const g of library.games) {
+      const has = saveStems.has(g.filename.replace(/\.[^.]+$/, '').toLowerCase());
+      if (has && !g.hasSave) savesFound++;
+      g.hasSave = has;
+    }
+  }
+
+  return { imported, savesFound, shotsSeen: shots.length };
 }
 
 // ── SCREENSCRAPER ────────────────────────────────────────
@@ -3500,6 +3638,8 @@ function encodeLibretroName(name) {
 
 // Cache: platform → array of boxart filenames (without .png)
 const LIBRETRO_TREE_CACHE = new Map();
+// Cache: platform → Set of lowercased names, for O(1) exact-variant checks
+const LIBRETRO_NAME_SETS = new Map();
 
 async function getLibretroBoxartNames(platform) {
   if (LIBRETRO_TREE_CACHE.has(platform)) return LIBRETRO_TREE_CACHE.get(platform);
@@ -3555,7 +3695,10 @@ async function findLibretroUrl(game) {
 
   const romBase = game.filename.replace(/\.[^.]+$/, '');
 
-  // Pass 1: exact filename + common No-Intro region variants (fast, parallel per platform)
+  // Pass 1: exact filename + common No-Intro region variants, checked against the
+  // CACHED repo file list — pure string comparisons, no network per game.
+  // (This used to probe up to 33 image URLs sequentially with a 6s timeout each;
+  // a miss could take minutes per game before the fuzzy pass even started.)
   const variants = [
     romBase,
     romBase + ' (USA)',
@@ -3573,10 +3716,20 @@ async function findLibretroUrl(game) {
   for (const plat of targetPlatforms) {
     const sys = LIBRETRO_SYSTEMS[plat];
     if (!sys) continue;
+    const names = await getLibretroBoxartNames(plat); // one tree fetch per platform, cached
+    if (!names.length) continue;
+    const nameSet = LIBRETRO_NAME_SETS.get(plat) || (() => {
+      const s = new Set(names.map(n => n.toLowerCase()));
+      LIBRETRO_NAME_SETS.set(plat, s);
+      return s;
+    })();
     const base = 'https://raw.githubusercontent.com/libretro-thumbnails/' + sys + '/master/Named_Boxarts/';
     for (const v of variants) {
-      const url = base + encodeLibretroName(v) + '.png';
-      if (await verifyImageUrl(url)) return url;
+      if (nameSet.has(v.toLowerCase())) {
+        // Find the original-cased name for the URL
+        const exact = names.find(n => n.toLowerCase() === v.toLowerCase());
+        return base + encodeLibretroName(exact) + '.png';
+      }
     }
   }
 
@@ -4058,6 +4211,31 @@ function renderTagFilter() {
     tags.map(t => `<option value="${escHtml(t)}"${t === ui.tag ? ' selected' : ''}>${escHtml(t)}</option>`).join('');
 }
 
+// Genre values from TGDB can be compound ("Action | Platform") — split for the dropdown
+function getAllGenres() {
+  const set = new Set();
+  library.games.forEach(g => {
+    (g.genre || '').split(/[,|\/]/).forEach(part => {
+      const p = part.trim();
+      if (p) set.add(p);
+    });
+  });
+  return [...set].sort((a, b) => a.localeCompare(b));
+}
+
+function renderGenreFilter() {
+  const sel = el('genre-filter-select');
+  const genres = getAllGenres();
+  if (!genres.length) {
+    sel.style.display = 'none';
+    ui.genre = 'all';
+    return;
+  }
+  sel.style.display = '';
+  sel.innerHTML = `<option value="all">🎭 ${ui.genre !== 'all' ? escHtml(ui.genre) : 'Genres'}</option>` +
+    genres.map(g => `<option value="${escHtml(g)}"${g === ui.genre ? ' selected' : ''}>${escHtml(g)}</option>`).join('');
+}
+
 // ── RENDERING ────────────────────────────────────────────
 function getFilteredGames() {
   let games = [...library.games];
@@ -4086,6 +4264,10 @@ function getFilteredGames() {
   if (ui.tag !== 'all') {
     games = games.filter(g => (g.tags || []).includes(ui.tag));
   }
+  if (ui.genre !== 'all') {
+    const q = ui.genre.toLowerCase();
+    games = games.filter(g => (g.genre || '').toLowerCase().includes(q));
+  }
   if (ui.search) {
     const q = ui.search.toLowerCase();
     games = games.filter(g =>
@@ -4113,17 +4295,22 @@ function getFilteredGames() {
   return games;
 }
 
+// Full refresh: library-wide chrome + the filtered grid.
 function renderGames() {
-  const grid = el('game-grid');
-  const statsView = el('stats-view');
-  const emptyState = el('empty-state');
-  const noResults = el('no-results');
+  renderChrome();
+  renderGrid();
+}
 
+// Library-wide UI (counts, tabs, tag dropdown, now-playing strip, collection chip).
+// None of it depends on the current filter/search, so search keystrokes skip it
+// and call renderGrid() directly.
+function renderChrome() {
   // Ensure collections array exists
   if (!library.collections) library.collections = [];
 
-  // Update tag filter dropdown
+  // Update tag + genre filter dropdowns
   renderTagFilter();
+  renderGenreFilter();
 
   // Update count badge
   const total = library.games.length;
@@ -4156,9 +4343,7 @@ function renderGames() {
         <div class="now-playing-title">${escHtml(g.title)}</div>
       </div>`;
     }).join('');
-    npScroll.querySelectorAll('.now-playing-card').forEach(card => {
-      card.addEventListener('click', () => openGameModal(card.dataset.id));
-    });
+    // (clicks handled by delegated listener in bootstrap)
   } else {
     npSection.style.display = 'none';
   }
@@ -4184,6 +4369,17 @@ function renderGames() {
   } else if (collChipEl) {
     collChipEl.remove();
   }
+}
+
+// The filtered game grid (or stats view). Cheap enough to run per (debounced)
+// search keystroke; card clicks are handled by ONE delegated listener installed
+// in bootstrap() — nothing is attached per card.
+function renderGrid() {
+  const grid = el('game-grid');
+  const statsView = el('stats-view');
+  const emptyState = el('empty-state');
+  const noResults = el('no-results');
+  const total = library.games.length;
 
   // Handle stats view
   if (ui.view === 'stats') {
@@ -4236,37 +4432,10 @@ function renderGames() {
 
   grid.innerHTML = games.map(g => cardHTML(g, dupeIds.has(g.id))).join('');
 
-  // Attach click listeners
+  // Restore bulk selection state (clicks are delegated — see bootstrap)
   if (ui.bulk) {
-    // In bulk mode: toggle selection, don't open modal
     grid.querySelectorAll('.game-card').forEach(card => {
-      const id = card.dataset.id;
-      if (selectedIds.has(id)) card.setAttribute('data-selected', 'true');
-      card.addEventListener('click', () => {
-        if (selectedIds.has(id)) {
-          selectedIds.delete(id);
-          card.removeAttribute('data-selected');
-        } else {
-          selectedIds.add(id);
-          card.setAttribute('data-selected', 'true');
-        }
-        updateBulkCount();
-      });
-    });
-  } else {
-    grid.querySelectorAll('.game-card').forEach(card => {
-      card.addEventListener('click', e => {
-        // Clicking a tag chip filters by that tag instead of opening modal
-        const tagChip = e.target.closest('.card-tag');
-        if (tagChip) {
-          e.stopPropagation();
-          ui.tag = tagChip.dataset.tag;
-          renderTagFilter();
-          renderGames();
-          return;
-        }
-        openGameModal(card.dataset.id);
-      });
+      if (selectedIds.has(card.dataset.id)) card.setAttribute('data-selected', 'true');
     });
   }
 }
@@ -4275,6 +4444,20 @@ function updateBulkCount() {
   el('bulk-count').textContent = selectedIds.size + ' selected';
   const filtered = getFilteredGames(); // once — this filters+sorts the whole library
   el('bulk-select-all').checked = filtered.length > 0 && filtered.every(g => selectedIds.has(g.id));
+}
+
+// Downscaled grid thumbnails via the images.weserv.nl resizing proxy for
+// known-heavy hosts (libretro PNGs are often 500KB+ and the grid shows hundreds).
+// Full-resolution originals are still used in the modal and fullscreen; the card
+// <img> keeps data-orig so onerror can fall back to the original if the proxy is down.
+const THUMB_HOSTS = new Set(['raw.githubusercontent.com', 'cdn.thegamesdb.net']);
+function thumbUrl(src, w = 320) {
+  try {
+    if (!src || src.startsWith('data:') || src.startsWith('blob:')) return src;
+    const u = new URL(src);
+    if (!THUMB_HOSTS.has(u.hostname)) return src; // leave itch GIFs etc. untouched
+    return 'https://images.weserv.nl/?url=' + encodeURIComponent(src.replace(/^https?:\/\//, '')) + '&w=' + w + '&fit=inside&we';
+  } catch { return src; }
 }
 
 function cardHTML(g, isDupe = false) {
@@ -4294,8 +4477,11 @@ function cardHTML(g, isDupe = false) {
     : allShots.filter(Boolean);
 
   const errFallback = `var p=document.createElement('div');p.className='card-art-placeholder';p.innerHTML='<div class=\\'card-art-placeholder-icon\\'>🎮</div><div class=\\'card-art-placeholder-label\\'>${plat.label}</div>';this.replaceWith(p)`;
+  // Thumb proxy first; if it errors, retry the original once, then placeholder
+  const errWithOrigFallback = `if(this.dataset.orig&&this.src!==this.dataset.orig){this.src=this.dataset.orig;}else{${errFallback}}`;
+  const thumbSrc = primarySrc ? thumbUrl(primarySrc) : null;
   const artHTML = primarySrc
-    ? `<img src="${escHtml(primarySrc)}" alt="" loading="lazy" onerror="${errFallback}">`
+    ? `<img src="${escHtml(thumbSrc)}"${thumbSrc !== primarySrc ? ` data-orig="${escHtml(primarySrc)}"` : ''} alt="" loading="lazy" onerror="${errWithOrigFallback}">`
     : `<div class="card-art-placeholder"><div class="card-art-placeholder-icon">🎮</div><div class="card-art-placeholder-label">${plat.label}</div></div>`;
 
   // data-video: proxied SS video URL (loaded lazily on hover, never in static HTML)
@@ -4698,9 +4884,13 @@ function openGameModal(id, opts = {}) {
 
   // Title (editable input) & platform badges
   el('modal-title-input').value = game.title;
-  const badges = [`<span class="badge" style="color:${plat.color};border-color:${plat.color}33;background:${plat.color}15">${plat.label}</span>`];
-  if (game.homebrew) badges.push('<span class="badge badge-hb">Homebrew</span>');
-  el('modal-badges').innerHTML = badges.join('');
+  const renderBadges = () => {
+    const b = [`<span class="badge" style="color:${plat.color};border-color:${plat.color}33;background:${plat.color}15">${plat.label}</span>`];
+    if (game.homebrew) b.push('<span class="badge badge-hb">Homebrew</span>');
+    if (game.hasSave) b.push('<span class="badge" title="Battery save found on SD card">💾 Save</span>');
+    el('modal-badges').innerHTML = b.join('');
+  };
+  renderBadges();
 
   // Homebrew toggle
   el('modal-hb-retail').classList.toggle('active', !game.homebrew);
@@ -4709,17 +4899,14 @@ function openGameModal(id, opts = {}) {
     game.homebrew = false;
     el('modal-hb-retail').classList.add('active');
     el('modal-hb-homebrew').classList.remove('active');
-    const b = [`<span class="badge" style="color:${plat.color};border-color:${plat.color}33;background:${plat.color}15">${plat.label}</span>`];
-    el('modal-badges').innerHTML = b.join('');
+    renderBadges();
     scheduleSave();
   };
   el('modal-hb-homebrew').onclick = () => {
     game.homebrew = true;
     el('modal-hb-homebrew').classList.add('active');
     el('modal-hb-retail').classList.remove('active');
-    const b = [`<span class="badge" style="color:${plat.color};border-color:${plat.color}33;background:${plat.color}15">${plat.label}</span>`,
-               '<span class="badge badge-hb">Homebrew</span>'];
-    el('modal-badges').innerHTML = b.join('');
+    renderBadges();
     scheduleSave();
   };
 
@@ -5096,6 +5283,36 @@ function importJSON(text) {
   scheduleSave();
 }
 
+// Downscale + re-encode an image (File/Blob or data URL) to a compact data URL.
+// The whole library JSON re-uploads to Drive on every save, so raw phone photos
+// (3-8MB each) made sync slow and fragile. Pixel-art-sized images stay lossless
+// PNG; anything bigger becomes a bounded JPEG.
+function compressImageToDataUrl(source, maxDim = 800, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = typeof source === 'string' ? source : URL.createObjectURL(source);
+    const cleanup = () => { if (url.startsWith('blob:')) URL.revokeObjectURL(url); };
+    img.onload = () => {
+      const srcW = img.naturalWidth, srcH = img.naturalHeight;
+      const scale = Math.min(1, maxDim / Math.max(srcW, srcH));
+      const w = Math.max(1, Math.round(srcW * scale));
+      const h = Math.max(1, Math.round(srcH * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = scale < 1; // crisp pixels when not downscaling
+      ctx.drawImage(img, 0, 0, w, h);
+      cleanup();
+      // Small images (GB/GBA screenshots and the like) keep lossless PNG —
+      // JPEG smears pixel art. Photos/scans get JPEG.
+      const usePng = srcW * srcH <= 640 * 576;
+      resolve(canvas.toDataURL(usePng ? 'image/png' : 'image/jpeg', quality));
+    };
+    img.onerror = () => { cleanup(); reject(new Error('image decode failed')); };
+    img.src = url;
+  });
+}
+
 function downloadFile(filename, content, type) {
   const blob = new Blob([content], { type });
   const url = URL.createObjectURL(blob);
@@ -5161,6 +5378,21 @@ function bootstrap() {
     ui.tag = e.target.value;
     renderGames();
   });
+  el('genre-filter-select').addEventListener('change', e => {
+    ui.genre = e.target.value;
+    renderGames();
+  });
+
+  // 🎲 random picker — respects current filters, prefers unplayed
+  el('btn-random').addEventListener('click', () => {
+    const pool = getFilteredGames();
+    if (!pool.length) { toast('No games match the current filters.', ''); return; }
+    const unplayed = pool.filter(g => g.status === 'unplayed');
+    const pickFrom = unplayed.length ? unplayed : pool;
+    const pick = pickFrom[Math.floor(Math.random() * pickFrom.length)];
+    openGameModal(pick.id);
+    toast(unplayed.length ? 'From your unplayed pile: ' + pick.title : 'Random pick: ' + pick.title, 'ok');
+  });
 
   // Manual save button
   el('btn-save').addEventListener('click', async () => {
@@ -5194,13 +5426,45 @@ function bootstrap() {
     el('search-wrap').classList.remove('has-value');
     renderGames();
   }
-  // Debounced — renderGames rebuilds the whole grid, far too heavy per keystroke
+  // Debounced, and only the grid — the filter chrome doesn't depend on search
   let searchTimer;
   el('search-input').addEventListener('input', e => {
     ui.search = e.target.value;
     el('search-wrap').classList.toggle('has-value', !!e.target.value);
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(renderGames, 150);
+    searchTimer = setTimeout(renderGrid, 150);
+  });
+
+  // ONE delegated click handler for all game cards (cards are re-created on every
+  // render — per-card listeners were re-attached thousands of times on big libraries)
+  el('game-grid').addEventListener('click', e => {
+    const card = e.target.closest('.game-card');
+    if (!card) return;
+    if (ui.bulk) {
+      const id = card.dataset.id;
+      if (selectedIds.has(id)) {
+        selectedIds.delete(id);
+        card.removeAttribute('data-selected');
+      } else {
+        selectedIds.add(id);
+        card.setAttribute('data-selected', 'true');
+      }
+      updateBulkCount();
+      return;
+    }
+    // Clicking a tag chip filters by that tag instead of opening the modal
+    const tagChip = e.target.closest('.card-tag');
+    if (tagChip) {
+      ui.tag = tagChip.dataset.tag;
+      renderTagFilter();
+      renderGames();
+      return;
+    }
+    openGameModal(card.dataset.id);
+  });
+  el('now-playing-scroll').addEventListener('click', e => {
+    const card = e.target.closest('.now-playing-card');
+    if (card) openGameModal(card.dataset.id);
   });
   el('search-clear').addEventListener('click', () => {
     clearSearch();
@@ -5217,23 +5481,23 @@ function bootstrap() {
 
   // Art file upload in modal
   el('modal-art-upload-btn').addEventListener('click', () => el('modal-art-file').click());
-  el('modal-art-file').addEventListener('change', e => {
+  el('modal-art-file').addEventListener('change', async e => {
     const file = e.target.files?.[0];
+    e.target.value = ''; // reset so same file can be re-selected
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
-      el('modal-art-url').value = ev.target.result; // base64 data URL
-      // Refresh gallery immediately
+    try {
+      const dataUrl = await compressImageToDataUrl(file); // bounded size before it hits the sync file
+      el('modal-art-url').value = dataUrl;
       const game = library.games.find(g => g.id === activeGameId);
       if (game) {
-        game.boxArt = ev.target.result;
+        game.boxArt = dataUrl;
         renderGames();
         scheduleSave();
         openGameModal(game.id, { preserveEdits: true }); // re-open to refresh gallery
       }
-    };
-    reader.readAsDataURL(file);
-    e.target.value = ''; // reset so same file can be re-selected
+    } catch {
+      toast('Could not read that image file.', 'err');
+    }
   });
 
   // Live art URL: when user pastes a URL into the art field, save + update gallery
@@ -5701,20 +5965,21 @@ function bootstrap() {
     openGameModal(activeGameId, { preserveEdits: true });
   });
   el('modal-shot-upload-btn').addEventListener('click', () => el('modal-shot-file').click());
-  el('modal-shot-file').addEventListener('change', e => {
+  el('modal-shot-file').addEventListener('change', async e => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
     const game = library.games.find(g => g.id === activeGameId);
     if (!game) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
+    try {
+      const dataUrl = await compressImageToDataUrl(file);
       if (!game.screenshots) game.screenshots = [];
-      game.screenshots.push(ev.target.result);
+      game.screenshots.push(dataUrl);
       scheduleSave();
       openGameModal(activeGameId, { preserveEdits: true });
-    };
-    reader.readAsDataURL(file);
-    e.target.value = '';
+    } catch {
+      toast('Could not read that image file.', 'err');
+    }
   });
 
   // Export / Import buttons
@@ -5850,10 +6115,12 @@ async function startAuth() {
 
   authBtn.addEventListener('click', () => {
     authStatus.textContent = 'Opening Google sign-in…';
-    tokenClient.requestAccessToken({ prompt: 'consent' });
+    // No prompt override: Google skips the consent screen for returning users
+    // with an existing grant (the popup opens and closes itself)
+    tokenClient.requestAccessToken();
   });
 
-  // Try silent re-auth from cached token; otherwise just show sign-in screen
+  // Try re-auth from the per-tab cached token; otherwise just show sign-in screen
   // (never call requestAccessToken automatically — browser blocks it as a popup without a user gesture)
   const stored = loadStoredToken();
   if (stored) {
@@ -5867,6 +6134,11 @@ async function startAuth() {
 // ── KICK OFF ─────────────────────────────────────────────
 bootstrap();
 startAuth();
+
+// PWA: register the service worker (https only — file:// is local dev/tests)
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  navigator.serviceWorker.register('sw.js').catch(e => console.warn('[CI] SW registration failed', e));
+}
 
 })(); // end IIFE
 </script>
