@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Syntax-check the inline JavaScript
+        run: |
+          node -e "
+            const s = require('fs').readFileSync('index.html', 'utf8');
+            const m = s.match(/<script(?![^>]*src=)[^>]*>([\\s\\S]*?)<\\/script>/);
+            if (!m) { console.error('no inline script found'); process.exit(1); }
+            require('fs').writeFileSync('/tmp/app.js', m[1]);
+          "
+          node --check /tmp/app.js
+          echo "inline JS parses cleanly"
+
+      - name: Install Playwright Chromium
+        run: |
+          npm init -y > /dev/null
+          npm install playwright > /dev/null
+          npx playwright install --with-deps chromium
+
+      - name: Run smoke test
+        run: node tests/smoke.mjs
