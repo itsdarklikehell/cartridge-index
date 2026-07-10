@@ -2355,8 +2355,8 @@ body {
     <div class="modal-footer">
       <button class="btn" id="modal-delete" style="color:#f87171;margin-right:auto;">Remove</button>
       <button class="btn" id="modal-enrich-one" title="Re-fetch art &amp; metadata for this game">Enrich</button>
-      <button class="btn" id="modal-cancel">Cancel</button>
-      <button class="btn btn-primary" id="modal-save">Save</button>
+      <span style="font-size:11px;color:var(--text-muted);align-self:center">Changes save automatically</span>
+      <button class="btn btn-primary" id="modal-done">Close</button>
     </div>
   </div>
 </div>
@@ -2402,12 +2402,14 @@ body {
       </div>
 
       <div class="settings-section" style="gap:6px">
-        <div class="settings-section-title">Export</div>
+        <div class="settings-section-title">Backup &amp; Restore</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <button class="btn" id="btn-export-csv">Export CSV</button>
           <button class="btn" id="btn-export-json">Export JSON</button>
+          <button class="btn" id="btn-import-json">Import JSON</button>
+          <input type="file" id="import-json-file" accept=".json,application/json" style="display:none">
         </div>
-        <div class="field-hint">Downloads your library as a file.</div>
+        <div class="field-hint">JSON export is a full backup (games + collections) that Import can restore. CSV is a spreadsheet-friendly game list only.</div>
       </div>
 
       <div class="settings-section" style="gap:6px">
@@ -2498,7 +2500,7 @@ body {
 'use strict';
 
 // ── CONFIG ──────────────────────────────────────────────
-const APP_VERSION    = 'v0.5.46';
+const APP_VERSION    = 'v0.5.47';
 const GOOGLE_CLIENT_ID = '1014634679996-uqoho41464ps4oseerjveu2vo3ttm7lh.apps.googleusercontent.com';
 const SCOPE          = 'https://www.googleapis.com/auth/drive.appdata';
 const DRIVE_FILENAME = 'cartridge-index-state.json';
@@ -4780,6 +4782,7 @@ function openGameModal(id, opts = {}) {
     el('modal-tags-display').querySelectorAll('.tag-chip-remove').forEach(btn => {
       btn.onclick = () => {
         modalTags = modalTags.filter(t => t !== btn.dataset.tag);
+        commitModalTags(game);
         renderModalTags();
       };
     });
@@ -4793,6 +4796,7 @@ function openGameModal(id, opts = {}) {
       const val = tagInput.value.trim().replace(/,$/, '');
       if (val && !modalTags.includes(val)) {
         modalTags.push(val);
+        commitModalTags(game);
         renderModalTags();
       }
       tagInput.value = '';
@@ -4882,41 +4886,43 @@ function closeGameModal() {
   activeGameId = null;
 }
 
-function saveGameModal() {
-  const game = library.games.find(g => g.id === activeGameId);
+// ── SAVE-ON-CHANGE (v0.5.47) ─────────────────────────────
+// Every modal field commits as it's edited — same model the rating and
+// homebrew toggle always used. There is no staged state and no Save button,
+// so edits can't be lost by closing, navigating with [ ], or a modal refresh.
+
+// The game currently open in the modal, or null
+function activeGame() {
+  return library.games.find(g => g.id === activeGameId) || null;
+}
+
+// Commit the in-modal tag list to the game and sync (tags save-on-change too)
+function commitModalTags(game) {
   if (!game) return;
-
-  // Editable metadata
-  const newTitle = el('modal-title-input').value.trim();
-  if (newTitle) game.title = newTitle;
-
-  game.year      = el('modal-edit-year').value.trim()      || null;
-  game.players   = el('modal-edit-players').value.trim()   || null;
-  game.genre     = el('modal-edit-genre').value.trim()     || null;
-  game.developer = el('modal-edit-developer').value.trim() || null;
-  game.publisher = el('modal-edit-publisher').value.trim() || null;
-
-  // Box art URL (only update if the field has changed from current value)
-  const artUrl = el('modal-art-url').value.trim();
-  if (artUrl !== (game.boxArt || '')) {
-    game.boxArt = artUrl || null;
-    game.ssAttempted = false; // allow re-enrich if art was cleared
-  }
-
-  const activeStatus = document.querySelector('#modal-status-picker .status-btn.active');
-  if (activeStatus) game.status = activeStatus.dataset.s;
-
-  const litStars = document.querySelectorAll('#modal-stars .star.lit').length;
-  game.rating = litStars || null;
-
-  game.notes = el('modal-notes').value.trim();
-  game.tags  = [...modalTags];
-
-  game.searchOverride = el('modal-search-override').value.trim() || null;
-
-  closeGameModal();
-  renderGames();
+  game.tags = [...modalTags];
+  renderGames(); // tag chips show on cards and in the tag filter
   scheduleSave();
+}
+
+// Wire a text input to a game field: commits on change (blur/Enter),
+// and for textareas also on a short input debounce so typed notes survive
+// even a browser crash within a couple of seconds.
+function bindModalField(inputId, commit) {
+  const input = el(inputId);
+  let debounce;
+  const fire = () => {
+    const game = activeGame();
+    if (!game) return;
+    commit(game, input.value);
+    scheduleSave();
+  };
+  input.addEventListener('change', fire);
+  if (input.tagName === 'TEXTAREA') {
+    input.addEventListener('input', () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(fire, 600);
+    });
+  }
 }
 
 function updateStars(rating) {
@@ -5028,7 +5034,66 @@ function exportCSV() {
 }
 
 function exportJSON() {
-  downloadFile('cartridge-index.json', JSON.stringify(library.games, null, 2), 'application/json');
+  // Full backup: the entire library object (games + collections + meta),
+  // with session-only blob: URLs stripped — restorable via Import JSON.
+  const stamp = new Date().toISOString().slice(0, 10);
+  downloadFile('cartridge-index-backup-' + stamp + '.json',
+    JSON.stringify(library, persistReplacer, 2), 'application/json');
+}
+
+// ── IMPORT / RESTORE ─────────────────────────────────────
+// Accepts a full-library backup ({games:[...], collections:[...]}) or a legacy
+// games-only array export. Offers Replace (restore) or Merge (add missing).
+function importJSON(text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    toast('That file isn’t valid JSON.', 'err');
+    return;
+  }
+  // Legacy export was just the games array
+  if (Array.isArray(data)) data = { games: data, collections: [] };
+  if (!data || !Array.isArray(data.games)) {
+    toast('That doesn’t look like a Cartridge Index backup (no games list found).', 'err');
+    return;
+  }
+  const bad = data.games.find(g => !g || typeof g !== 'object' || !g.id || !g.filename);
+  if (bad) {
+    toast('Backup contains invalid game entries — import cancelled.', 'err');
+    return;
+  }
+  scrubBlobUrls(data);
+  if (!Array.isArray(data.collections)) data.collections = [];
+
+  const replace = library.games.length === 0 || confirm(
+    'Import ' + data.games.length + ' games from backup.\n\n' +
+    'OK = REPLACE your current library (' + library.games.length + ' games) with the backup\n' +
+    'Cancel = MERGE: keep everything you have and only add games/collections missing from it'
+  );
+
+  if (replace) {
+    library = {
+      games: data.games,
+      collections: data.collections,
+      lastSync: data.lastSync || null,
+      version: data.version || 1,
+    };
+    toast('Library replaced from backup — ' + library.games.length + ' games.', 'ok');
+  } else {
+    const haveGames = new Set(library.games.map(g => g.id));
+    const newGames = data.games.filter(g => !haveGames.has(g.id));
+    library.games.push(...newGames);
+    if (!library.collections) library.collections = [];
+    const haveColls = new Set(library.collections.map(c => c.id));
+    const newColls = data.collections.filter(c => c && c.id && !haveColls.has(c.id));
+    library.collections.push(...newColls);
+    toast('Merged: added ' + newGames.length + ' games and ' + newColls.length + ' collections from backup.', 'ok');
+  }
+
+  if (library.games.length > 0) el('btn-enrich').disabled = false;
+  renderGames();
+  scheduleSave();
 }
 
 function downloadFile(filename, content, type) {
@@ -5162,6 +5227,8 @@ function bootstrap() {
       const game = library.games.find(g => g.id === activeGameId);
       if (game) {
         game.boxArt = ev.target.result;
+        renderGames();
+        scheduleSave();
         openGameModal(game.id, { preserveEdits: true }); // re-open to refresh gallery
       }
     };
@@ -5169,13 +5236,16 @@ function bootstrap() {
     e.target.value = ''; // reset so same file can be re-selected
   });
 
-  // Live art URL preview: when user pastes a URL into the art field, update gallery
+  // Live art URL: when user pastes a URL into the art field, save + update gallery
   el('modal-art-url').addEventListener('change', e => {
     const game = library.games.find(g => g.id === activeGameId);
     if (!game) return;
     const url = e.target.value.trim();
     if (url !== (game.boxArt || '')) {
       game.boxArt = url || null;
+      if (!url) game.ssAttempted = false; // allow re-enrich if art was cleared
+      renderGames();
+      scheduleSave();
       openGameModal(game.id, { preserveEdits: true });
     }
   });
@@ -5330,18 +5400,33 @@ function bootstrap() {
     toast('Signed out.', 'ok');
   });
   el('settings-clear-data').addEventListener('click', () => {
-    if (!confirm('Clear ALL game data? This cannot be undone.')) return;
+    if (!confirm('Clear ALL game data?\n\nA JSON backup will download first, so you can restore via Import JSON if you change your mind.')) return;
+    // Safety net: download a full backup before wiping (local + Drive both go)
+    if (library.games.length > 0) exportJSON();
     library = { games: [], collections: [], lastSync: null, version: 1 };
     el('settings-modal').classList.remove('open');
     renderGames();
     scheduleSave();
-    toast('All game data cleared.', 'ok');
+    toast('All game data cleared. A backup was downloaded — use Import JSON to restore.', 'ok');
   });
 
   // Game modal
   el('modal-close').addEventListener('click', closeGameModal);
-  el('modal-cancel').addEventListener('click', closeGameModal);
-  el('modal-save').addEventListener('click', saveGameModal);
+  el('modal-done').addEventListener('click', closeGameModal);
+
+  // Save-on-change field bindings (see bindModalField)
+  bindModalField('modal-title-input', (g, v) => {
+    const t = v.trim();
+    if (t) { g.title = t; } else { el('modal-title-input').value = g.title; } // never allow an empty title
+    renderGames();
+  });
+  bindModalField('modal-edit-year',      (g, v) => { g.year      = v.trim() || null; renderGames(); });
+  bindModalField('modal-edit-players',   (g, v) => { g.players   = v.trim() || null; });
+  bindModalField('modal-edit-genre',     (g, v) => { g.genre     = v.trim() || null; });
+  bindModalField('modal-edit-developer', (g, v) => { g.developer = v.trim() || null; renderGames(); });
+  bindModalField('modal-edit-publisher', (g, v) => { g.publisher = v.trim() || null; });
+  bindModalField('modal-notes',          (g, v) => { g.notes     = v; });
+  bindModalField('modal-search-override',(g, v) => { g.searchOverride = v.trim() || null; });
   el('modal-enrich-one').addEventListener('click', async () => {
     if (!activeGameId) return;
     const game = library.games.find(g => g.id === activeGameId);
@@ -5412,12 +5497,17 @@ function bootstrap() {
     if (e.target === el('settings-modal')) el('settings-modal').classList.remove('open');
   });
 
-  // Status picker in modal
+  // Status picker in modal — saves immediately like every other field
   el('modal-status-picker').addEventListener('click', e => {
     const btn = e.target.closest('.status-btn');
     if (!btn) return;
     document.querySelectorAll('#modal-status-picker .status-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
+    const game = activeGame();
+    if (!game) return;
+    game.status = btn.dataset.s;
+    renderGames();
+    scheduleSave();
   });
 
   // Stars in modal — save immediately on click
@@ -5627,9 +5717,19 @@ function bootstrap() {
     e.target.value = '';
   });
 
-  // Export buttons
+  // Export / Import buttons
   el('btn-export-csv').addEventListener('click', () => { exportCSV(); });
   el('btn-export-json').addEventListener('click', () => { exportJSON(); });
+  el('btn-import-json').addEventListener('click', () => el('import-json-file').click());
+  el('import-json-file').addEventListener('change', e => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-selecting the same file
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => importJSON(ev.target.result);
+    reader.onerror = () => toast('Could not read that file.', 'err');
+    reader.readAsText(file);
+  });
 
   // Fetch from itch.io by URL
   el('modal-fetch-itch').addEventListener('click', async () => {
