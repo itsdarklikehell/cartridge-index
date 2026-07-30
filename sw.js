@@ -1,6 +1,6 @@
 // Cartridge Index service worker.
 // CACHE version must match APP_VERSION in index.html — CI checks this.
-const CACHE = 'cartridge-index-v0.6.0';
+const CACHE = 'cartridge-index-v0.6.1';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {

@@ -2507,7 +2507,7 @@ body {
 'use strict';
 
 // ── CONFIG ──────────────────────────────────────────────
-const APP_VERSION    = 'v0.6.0'; // keep in sync with CACHE in sw.js (CI checks)
+const APP_VERSION    = 'v0.6.1'; // keep in sync with CACHE in sw.js (CI checks)
 const GOOGLE_CLIENT_ID = '1014634679996-uqoho41464ps4oseerjveu2vo3ttm7lh.apps.googleusercontent.com';
 const SCOPE          = 'https://www.googleapis.com/auth/drive.appdata';
 const DRIVE_FILENAME = 'cartridge-index-state.json';
@@ -4335,8 +4335,9 @@ function renderChrome() {
   if (nowPlaying.length > 0) {
     npSection.style.display = '';
     npScroll.innerHTML = nowPlaying.map(g => {
-      const thumb = g.boxArt
-        ? `<img src="${escHtml(g.boxArt)}" alt="" onerror="this.style.display='none'">`
+      const npSrc = g.boxArt || (g.screenshots || []).find(s => !isVideoUrl(s));
+      const thumb = npSrc
+        ? `<img src="${escHtml(npSrc)}" alt="" onerror="this.style.display='none'">`
         : `<span style="font-size:24px;opacity:.3">🎮</span>`;
       return `<div class="now-playing-card" data-id="${g.id}">
         <div class="now-playing-thumb">${thumb}</div>
@@ -4465,16 +4466,20 @@ function cardHTML(g, isDupe = false) {
   const statusColor = STATUS_COLORS[g.status] || '#444';
   const stars = g.rating ? '★'.repeat(g.rating) + '☆'.repeat(5 - g.rating) : '';
 
-  // Primary image — respects the art/screenshot toggle
+  // Primary image — respects the art/screenshot toggle.
+  // Either mode falls back to the other kind, so games with only
+  // screenshots (or only box art) never show the placeholder.
   const allShots = (g.screenshots || []).filter(s => !isVideoUrl(s));
   const videoShot = (g.screenshots || []).find(s => isVideoUrl(s));
   const firstShot = allShots[0];
-  const primarySrc = ui.gridImg === 'shot' ? (firstShot || g.boxArt) : g.boxArt;
+  const primarySrc = ui.gridImg === 'shot' ? (firstShot || g.boxArt) : (g.boxArt || firstShot);
 
-  // Images for hover cycling (static + GIFs, no videos — videos via data-video)
+  // Images for hover cycling (static + GIFs, no videos — videos via data-video).
+  // When the primary image is already a screenshot fallback, skip that first
+  // shot here so hover doesn't start on the image the card is already showing.
   const cycleImgs = ui.gridImg === 'shot'
     ? [g.boxArt, ...allShots.slice(1)].filter(Boolean)
-    : allShots.filter(Boolean);
+    : (g.boxArt ? allShots : allShots.slice(1)).filter(Boolean);
 
   const errFallback = `var p=document.createElement('div');p.className='card-art-placeholder';p.innerHTML='<div class=\\'card-art-placeholder-icon\\'>🎮</div><div class=\\'card-art-placeholder-label\\'>${plat.label}</div>';this.replaceWith(p)`;
   // Thumb proxy first; if it errors, retry the original once, then placeholder
